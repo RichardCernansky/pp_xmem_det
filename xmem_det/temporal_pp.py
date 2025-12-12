@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+import torch.nn as nn
 
 from pcdet.models.detectors.pointpillar import PointPillar
 from xmem_det.xmem_wrapper import XMemBackboneWrapper
@@ -17,6 +18,8 @@ class TemporalPointPillar(PointPillar):
             bev_channels=c_bev,
         )
         self.pc_range = pc_range
+        self.temporal_fusion = nn.Conv2d(c_bev + self.xmem.hidden_dim, c_bev, kernel_size=1)
+
 
     def _build_scene_mask_from_bev(self, spatial_features_2d: torch.Tensor):
         with torch.no_grad():
@@ -95,22 +98,25 @@ class TemporalPointPillar(PointPillar):
 
                 # B, _, bev_h, bev_w = scene_mask.shape
 
-                occ_logits = self.xmem.forward_step(
+                occ_logits, hidden_features = self.xmem.forward_step(
                     t_seq,
                     bev,
                     scene_mask=scene_mask,
                 )
 
-                gate = torch.sigmoid(
-                    F.interpolate(
-                        occ_logits,
-                        size=(bev.shape[-2], bev.shape[-1]),
-                        mode="bilinear",
-                        align_corners=False,
-                    )
-                )
-                bev = bev * gate
-                batch_dict["spatial_features_2d"] = bev
+                # Step 1: Apply occupancy gate
+                gate = torch.sigmoid(occ_logits)
+                bev_gated = bev * gate  # (B, C_bev, H, W)
+                
+                # Step 2: Concatenate with temporal features
+                bev_with_temporal = torch.cat([bev_gated, hidden_features], dim=1)
+                # Shape: (B, C_bev + D_hidden, H, W)
+                
+                # Step 3: Fuse using 1x1 conv
+                bev_fused = self.temporal_fusion(bev_with_temporal)  # (B, C_bev, H, W)
+                
+                # Update batch_dict with enhanced features
+                batch_dict["spatial_features_2d"] = bev_fused
         
         # Call dense_head
         batch_dict = self.dense_head(batch_dict)

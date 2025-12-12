@@ -107,6 +107,7 @@ class XMemBackboneWrapper(nn.Module):
             scene_mask_padded = scene_mask
         
         occupancy_logits_list = []
+        hidden_features_list = []
         
         for b in range(B):
             mm = self.mms[b]
@@ -158,9 +159,9 @@ class XMemBackboneWrapper(nn.Module):
             
             if has_memory:
                 mem_readout = mm.match_memory(k_l, sel_l if self.enable_long_term else None).unsqueeze(0)
-                _, _, pred_prob_with_bg = self.xmem_core.segment(
+                hidden_local, _, pred_prob_with_bg = self.xmem_core.segment(
                     (f16, f8, f4), mem_readout, mm.get_hidden(),
-                    h_out=False, strip_bg=False
+                    h_out=True, strip_bg=False
                 )
                 # pred_prob_with_bg: (1, K+1, H_out, W_out)
                 pred_prob_with_bg = pred_prob_with_bg[0]  # (K+1, H_out, W_out)
@@ -169,6 +170,9 @@ class XMemBackboneWrapper(nn.Module):
                     pred_fg = pred_prob_with_bg[1:].max(dim=0, keepdim=True)[0]  # (1, H_out, W_out)
                 else:
                     pred_fg = pred_prob_with_bg[0:1]
+
+                hidden_local = hidden_local.squeeze(1)  # (1, D_hidden, H, W)
+                hidden_features_list.append(hidden_local)
             else:
                 # No memory yet, use current mask
                 pred_fg = scene_mask_padded[b, 0:1]  # (1, H16, W16)
@@ -178,13 +182,21 @@ class XMemBackboneWrapper(nn.Module):
             logits = torch.log(pred_fg / (1 - pred_fg))  # (1, H_out, W_out)
             occupancy_logits_list.append(logits)
         
-        occupancy_logits = torch.stack(occupancy_logits_list, dim=0)  # (B, 1, H_out, W_out)
+        # Concatenate along batch dimension (dim=0)
+        occupancy_logits = torch.cat(occupancy_logits_list, dim=0)  # (B, 1, H_out, W_out)
+        hidden_features = torch.cat(hidden_features_list, dim=0)     # (B, D_hidden, H_feat, W_feat)
         
-        # Resize back to original if needed
+        # Resize both to original BEV resolution
         if occupancy_logits.shape[-2:] != (H, W):
             occupancy_logits = F.interpolate(
                 occupancy_logits, size=(H, W),
                 mode='bilinear', align_corners=False
             )
         
-        return occupancy_logits
+        if hidden_features.shape[-2:] != (H, W):
+            hidden_features = F.interpolate(
+                hidden_features, size=(H, W),
+                mode='bilinear', align_corners=False
+            )
+            
+            return occupancy_logits, hidden_features

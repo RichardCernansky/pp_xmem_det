@@ -116,7 +116,7 @@ def train_one_epoch(model, optimizer, train_loader, epoch, total_epochs, logger,
         clip_grad_norm_(model.parameters(), max_grad_norm)
         optimizer.step()
         
-        if (seq_idx + 1) % 10 == 0:
+        if (seq_idx + 1) % 50 == 0:
             lr = optimizer.param_groups[0]["lr"]
             avg_loss = total_loss.item() / T
             

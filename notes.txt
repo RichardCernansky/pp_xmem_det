@@ -1,0 +1,95 @@
+Extract per-timestep batch:
+    batch_dict_t = { k: v[:, t] for k, v in batch_seq.items() }
+
+Per-scene time index:
+    for each scene s in this batch:
+        local time t_s = t   (0,1,2,… within this sequence)
+        - transform into last timestep coordinates
+        - either explicit from laoder or implicit innetrwork
+
+TemporalPointPillar.forward_single_timestep(batch_dict_t, t_s)
+    ↓
+[standard PP stack, frame t of each scene]
+    points_{s,t}
+        → VFE
+        → 3D backbone
+        → BEV scatter
+        → 2D BEV backbone
+            → spatial_features_2d_{s,t} ∈ ℝ^{B×C_bev×H×W}
+                ↓
+            XMemBEVModule (temporal BEV module)
+                inputs:
+                    spatial_features_2d_{s,t}
+                    scene_token_s  (from batch_dict_t)
+                    local time index t_s
+                    internal memory + hidden state for scene s
+                internal operations (conceptually):
+                    frames_lidar_t = spatial_features_2d_{s,t}
+                    → XMemBackboneWrapper.forward_step(
+                          t_s,
+                          frames_lidar_t,
+                          scene_masks_{s,t},   (union BEV mask, or GT / predicted)
+                          agent_masks_{s,t},   (optional, can be None for detection-only)
+                          valids_mask_{s,t}    (optional)
+                      )
+                      → occ_logits_{s,t} ∈ ℝ^{B×1×H_m×W_m}
+                      → resize occ_logits_{s,t} → ℝ^{B×1×H×W}
+                      → gate_{s,t} = σ(occ_logits_{s,t})
+                      → spatial_features_2d_{s,t}^temporal
+                           = spatial_features_2d_{s,t} ⊙ gate_{s,t}
+                    updates:
+                      memory and hidden state for scene s
+                      t_s is implicitly advanced by the outer loop
+                output to PP:
+                    spatial_features_2d_{s,t}^temporal
+                ↓
+            replace in batch_dict_t:
+                batch_dict_t["spatial_features_2d"] = spatial_features_2d_{s,t}^temporal
+    ↓
+Dense detection head (PP multihead / AnchorHeadMulti)
+    uses spatial_features_2d_{s,t}^temporal
+    ↓
+    classification_logits_{s,t}, box_regression_{s,t}, dir_logits_{s,t}
+
+
+The detection head always sees the current frame’s BEV features, modulated by a gate that encodes history.
+
+You backpropagate using the loss for each frame (usually averaged over the sequence).
+
+So your mental model can be:
+
+“At each timestep I run PointPillars → XMem (which injects temporal context via a gate) 
+→ detection head. XMem carries memory across timesteps inside the same scene; 
+the detector always uses the current timestep’s gated BEV features.”
+
+
+
+
+
+def build_seq_loader(cfg, logger, workers, seq_len, stride):
+    dataset_cfg = cfg.DATA_CONFIG
+    class_names = cfg.CLASS_NAMES
+
+    train_set = NuScenesSeqDataset(
+        dataset_cfg=dataset_cfg,
+        class_names=class_names,
+        training=True,
+        root_path=None,
+        logger=logger,
+        seq_len=seq_len,
+        stride=stride,
+        nusc_version=dataset_cfg.VERSION,
+        nusc_dataroot=dataset_cfg.DATA_PATH,
+    )
+
+    train_loader = DataLoader(
+        train_set,
+        batch_size=1,
+        shuffle=True,
+        num_workers=min(workers, cfg.OPTIMIZATION.NUM_WORKERS),
+        pin_memory=True,
+        collate_fn=collate_seq,
+        drop_last=False,
+    )
+
+    return train_set, train_loader

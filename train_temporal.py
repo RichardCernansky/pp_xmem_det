@@ -9,6 +9,7 @@ from torch.utils.data import DataLoader
 from datasets.nuscenes_seq_dataset import NuScenesSeqDataset, collate_seq
 from xmem_det.temporal_pp import TemporalPointPillar
 
+
 from pcdet.config import cfg, cfg_from_yaml_file
 from pcdet.utils import common_utils
 
@@ -77,7 +78,8 @@ def train_one_epoch(model, optimizer, train_loader, epoch, total_epochs, logger,
         # Accumulate tb_dict and disp_dict across sequence
         accumulated_tb_dict = {}
         accumulated_disp_dict = {}
-        
+
+
         # Forward through entire sequence
         for t in range(T):
             frame = frames[t]

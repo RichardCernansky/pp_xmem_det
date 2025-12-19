@@ -93,3 +93,43 @@ def build_seq_loader(cfg, logger, workers, seq_len, stride):
     )
 
     return train_set, train_loader
+
+loss over the last or all timesteps? probably only the last
+how to stage the training
+
+
+## **My Recommendation:**
+
+**Start with Option 1 (Ego-Motion Compensation)** - it's:
+- ✅ Simple to implement (~50 lines of code)
+- ✅ High impact (+2-3% expected)
+- ✅ Works with your existing pipeline
+- ✅ Can add to both baseline-multiframe AND temporal models
+
+**Implementation Priority:**
+```
+1. Option 1: Ego-motion compensation (MUST HAVE)
+   → Warp previous masks to current frame
+   → Huge impact, easy to add
+
+2. Option 2: Ego-velocity features (NICE TO HAVE)
+   → Add ego motion as extra BEV channels
+   → Small improvement to vel_err
+
+3. Option 3: Motion-aware gating (ADVANCED)
+   → Only if Option 1 works well
+
+4. Option 4: Multi-frame fusion (RESEARCH EXTENSION)
+   → Could be a separate paper
+```
+
+**Expected Results with Option 1:**
+```
+Baseline (no ego-compensation):
+  mAP: 44.6%, NDS: 58.15%
+
+Baseline + Ego-Compensation:
+  mAP: 46-47%, NDS: 59-60%  (+2% just from alignment!)
+
+Temporal + Ego-Compensation:
+  mAP: 48-50%, NDS: 61-62%  (XMem + alignment = best)

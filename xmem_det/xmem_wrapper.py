@@ -51,19 +51,7 @@ class XMemBackboneWrapper(nn.Module):
         self.deep_update_sync = self.deep_update_every < 0
         
         for p in self.xmem_core.parameters():
-            p.requires_grad = False
-        
-        if self.train_config.get("train_xmem_decoder"):
-            for p in self.xmem_core.decoder.parameters():
-                p.requires_grad = True
-        
-        if self.train_config.get("train_xmem_key_encoder"):
-            for p in self.xmem_core.key_encoder.parameters():
-                p.requires_grad = True
-        
-        if self.train_config.get("train_xmem_val_encoder"):
-            for p in self.xmem_core.value_encoder.parameters():
-                p.requires_grad = True
+            p.requires_grad = True 
         
         self.bev_adapter = nn.Conv2d(bev_channels, 3, kernel_size=1)
         self.mms = []

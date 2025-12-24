@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CFG_FILE="cfgs/nuscenes_models/pointpillar_multihead.yaml"
+CFG_FILE="xmem_det/configs/temporal_pp_xmem_nuscenes.yaml"
 XMEM_CFG="xmem_det/configs/xmem.yaml"
 LATEST_CKPT="$(ls -1 log/ckpt_epoch_*.pth | sort -V | tail -n 1)"
 
@@ -11,10 +11,10 @@ SEQ_LEN=8
 STRIDE=4
 MAX_GRAD_NORM=35.0
 
-STAGE1_EPOCHS=5
+STAGE1_EPOCHS=2
 STAGE2A_EPOCHS=2
-STAGE2B_EPOCHS=6
-STAGE2C_EPOCHS=5
+STAGE2B_EPOCHS=8
+STAGE2C_EPOCHS=6
 STAGE3_EPOCHS=5
 
 HEAD_LR_MULT=0.1

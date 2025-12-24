@@ -31,15 +31,15 @@ def alpha_for_epoch(epoch, args):
     e1, e2a, e2b, e2c, _ = stage_plan(args)
 
     if epoch < e1:
-        return 0.0
+        return 0.3  # Start with some temporal (not 0!)
     if epoch < e2a:
         k = epoch - e1
         d = max(args.stage2a_epochs, 1)
-        return 0.3 * (k + 1) / d
+        return 0.3 + (0.7 - 0.3) * (k + 1) / d  # Ramp to 0.7
     if epoch < e2b:
         k = epoch - e2a
         d = max(args.stage2b_epochs, 1)
-        return 0.3 + (1.0 - 0.3) * (k + 1) / d
+        return 0.7 + (1.0 - 0.7) * (k + 1) / d  # Ramp to 1.0
     return 1.0
 
 def stage_name(epoch, args):
@@ -110,8 +110,47 @@ def build_seq_loader(cfg, logger, workers, seq_len, stride):
     return train_set, train_loader
 
 
-def train_one_epoch(model, optimizer, train_loader, epoch, total_epochs, logger, device, max_grad_norm, alpha_temporal: float):
+from collections import deque
+def train_one_epoch(
+    model,
+    optimizer,
+    train_loader,
+    epoch,
+    total_epochs,
+    logger,
+    device,
+    max_grad_norm,
+    alpha_temporal: float,
+    supervise_det: bool,
+    supervise_aux: bool,
+):
     model.train()
+
+    w = 200
+    w_loss = deque(maxlen=w)
+    w_cls = deque(maxlen=w)
+    w_loc = deque(maxlen=w)
+    w_dir = deque(maxlen=w)
+    w_aux = deque(maxlen=w)
+
+    sum_loss = 0.0
+    sum_cls = 0.0
+    sum_loc = 0.0
+    sum_dir = 0.0
+    sum_aux = 0.0
+
+    n_loss = 0
+    n_cls = 0
+    n_loc = 0
+    n_dir = 0
+    n_aux = 0
+
+    def _to_float(x):
+        return float(x.detach().item()) if hasattr(x, "detach") else float(x)
+
+    def _avg(dq):
+        return (sum(dq) / len(dq)) if len(dq) > 0 else None
+
     for seq_idx, seq in enumerate(train_loader):
         frames = seq["frames"]
         T_world_lidar = seq["T_world_lidar"]
@@ -121,11 +160,8 @@ def train_one_epoch(model, optimizer, train_loader, epoch, total_epochs, logger,
             model.reset_sequence(seq_idx)
 
         det_instance_masks_prev = None
-        total_loss = 0.0
-        accumulated_tb_dict = {}
-        accumulated_disp_dict = {}
 
-        for t in range(T):
+        for t in range(max(T - 1, 0)):
             frame = frames[t]
             batch_dict = to_torch_batch_dict(frame, device)
 
@@ -135,55 +171,120 @@ def train_one_epoch(model, optimizer, train_loader, epoch, total_epochs, logger,
                 T_rel_np = rel_T_curr_prev(T_world_lidar, t)
                 T_rel = torch.from_numpy(T_rel_np).to(device, non_blocking=True)
 
-            ret_dict, tb_dict, disp_dict, det_instance_masks_prev = model(
-                batch_dict,
-                t_seq=t,
-                det_instance_masks_prev=det_instance_masks_prev,
-                T_rel=T_rel,
-                alpha_temporal=alpha_temporal,
-            )
+            with torch.no_grad():
+                _, _, _, det_instance_masks_prev = model(
+                    batch_dict,
+                    t_seq=t,
+                    det_instance_masks_prev=det_instance_masks_prev,
+                    T_rel=T_rel,
+                    alpha_temporal=alpha_temporal,
+                    compute_det_loss=False,
+                    compute_aux_loss=False,
+                )
 
             if isinstance(det_instance_masks_prev, torch.Tensor):
                 det_instance_masks_prev = det_instance_masks_prev.detach()
 
-            loss_t = ret_dict["loss"]
-            total_loss = total_loss + loss_t
+        if T == 0:
+            continue
 
-            for key, val in tb_dict.items():
-                v = val.item() if hasattr(val, "item") else float(val)
-                accumulated_tb_dict[key] = accumulated_tb_dict.get(key, 0.0) + v
+        t_last = T - 1
+        frame = frames[t_last]
+        batch_dict = to_torch_batch_dict(frame, device)
 
-            for key, val in disp_dict.items():
-                v = val.item() if hasattr(val, "item") else float(val)
-                accumulated_disp_dict[key] = accumulated_disp_dict.get(key, 0.0) + v
+        if t_last == 0:
+            T_rel = None
+        else:
+            T_rel_np = rel_T_curr_prev(T_world_lidar, t_last)
+            T_rel = torch.from_numpy(T_rel_np).to(device, non_blocking=True)
 
-        total_loss = total_loss / max(T, 1)
+        ret_dict, tb_dict, disp_dict, det_masks_last = model(
+            batch_dict,
+            t_seq=t_last,
+            det_instance_masks_prev=det_instance_masks_prev,
+            T_rel=T_rel,
+            alpha_temporal=alpha_temporal,
+            compute_det_loss=bool(supervise_det),
+            compute_aux_loss=bool(supervise_aux),
+        )
 
-        for key in accumulated_tb_dict:
-            accumulated_tb_dict[key] /= max(T, 1)
-        for key in accumulated_disp_dict:
-            accumulated_disp_dict[key] /= max(T, 1)
+        loss = ret_dict["loss"]
 
         optimizer.zero_grad()
-        total_loss.backward()
+        loss.backward()
         clip_grad_norm_(model.parameters(), max_grad_norm)
         optimizer.step()
 
+        loss_v = _to_float(loss)
+        w_loss.append(loss_v)
+        sum_loss += loss_v
+        n_loss += 1
+
+        if "rpn_loss_cls" in tb_dict:
+            v = _to_float(tb_dict["rpn_loss_cls"])
+            w_cls.append(v)
+            sum_cls += v
+            n_cls += 1
+
+        if "rpn_loss_loc" in tb_dict:
+            v = _to_float(tb_dict["rpn_loss_loc"])
+            w_loc.append(v)
+            sum_loc += v
+            n_loc += 1
+
+        if "rpn_loss_dir" in tb_dict:
+            v = _to_float(tb_dict["rpn_loss_dir"])
+            w_dir.append(v)
+            sum_dir += v
+            n_dir += 1
+
+        if "aux_motion_tf" in tb_dict:
+            v = _to_float(tb_dict["aux_motion_tf"])
+            w_aux.append(v)
+            sum_aux += v
+            n_aux += 1
+
         if (seq_idx + 1) % 50 == 0:
             lr = optimizer.param_groups[0]["lr"]
-            loss_str = f"epoch {epoch + 1}/{total_epochs}, seq {seq_idx + 1}/{len(train_loader)}, "
-            loss_str += f"total_loss {total_loss.item():.4f}, "
-            if "rpn_loss_cls" in accumulated_tb_dict:
-                loss_str += f"cls {accumulated_tb_dict['rpn_loss_cls']:.4f}, "
-            if "rpn_loss_loc" in accumulated_tb_dict:
-                loss_str += f"loc {accumulated_tb_dict['rpn_loss_loc']:.4f}, "
-            if "rpn_loss_dir" in accumulated_tb_dict:
-                loss_str += f"dir {accumulated_tb_dict['rpn_loss_dir']:.4f}, "
-            if "aux_motion_tf" in accumulated_tb_dict:
-                loss_str += f"aux {accumulated_tb_dict['aux_motion_tf']:.4f}, "
+
+            win_loss = _avg(w_loss)
+            win_cls = _avg(w_cls)
+            win_loc = _avg(w_loc)
+            win_dir = _avg(w_dir)
+            win_aux = _avg(w_aux)
+
+            loss_str = (
+                f"epoch {epoch + 1}/{total_epochs}, seq {seq_idx + 1}/{len(train_loader)}, "
+                f"loss {loss_v:.4f}, win200 {win_loss:.4f}, "
+            )
+
+            if "rpn_loss_cls" in tb_dict:
+                loss_str += f"cls {_to_float(tb_dict['rpn_loss_cls']):.4f}, win200_cls {win_cls:.4f}, "
+            if "rpn_loss_loc" in tb_dict:
+                loss_str += f"loc {_to_float(tb_dict['rpn_loss_loc']):.4f}, win200_loc {win_loc:.4f}, "
+            if "rpn_loss_dir" in tb_dict:
+                loss_str += f"dir {_to_float(tb_dict['rpn_loss_dir']):.4f}, win200_dir {win_dir:.4f}, "
+            if "aux_motion_tf" in tb_dict:
+                loss_str += f"aux {_to_float(tb_dict['aux_motion_tf']):.4f}, win200_aux {win_aux:.4f}, "
+
             loss_str += f"lr {lr:.6e}"
             logger.info(loss_str)
 
+    epoch_avg_loss = sum_loss / max(n_loss, 1)
+    msg = f"epoch {epoch + 1}/{total_epochs} summary: avg_loss {epoch_avg_loss:.4f}"
+    if n_cls > 0:
+        msg += f", avg_cls {sum_cls / n_cls:.4f}"
+    if n_loc > 0:
+        msg += f", avg_loc {sum_loc / n_loc:.4f}"
+    if n_dir > 0:
+        msg += f", avg_dir {sum_dir / n_dir:.4f}"
+    if n_aux > 0:
+        msg += f", avg_aux {sum_aux / n_aux:.4f}"
+    if len(w_loss) > 0:
+        msg += f", win200_loss {_avg(w_loss):.4f}"
+    if len(w_aux) > 0:
+        msg += f", win200_aux {_avg(w_aux):.4f}"
+    logger.info(msg)
 
 
 def main():
@@ -251,7 +352,9 @@ def main():
     start_epoch = 0
 
     if args.resume_ckpt:
+
         resume_blob = torch.load(args.resume_ckpt, map_location="cpu")
+
         model.load_state_dict(resume_blob["model_state"], strict=True)
         start_epoch = int(resume_blob.get("epoch", 0))
     elif args.pretrained_pp_ckpt:
@@ -280,11 +383,11 @@ def main():
 
         if st != prev_stage:
             if st in ["stage1", "stage2a"]:
-                set_trainable_prefixes(model, ["xmem", "motion_mask_tf", "temporal_fusion"])
+                set_trainable_prefixes(model, ["xmem", "motion_transform_net", "aux_head", "temporal_fusion"])
             elif st == "stage2b":
-                set_trainable_prefixes(model, ["xmem", "motion_mask_tf", "temporal_fusion", "dense_head"])
+                set_trainable_prefixes(model, ["xmem", "motion_transform_net", "aux_head", "temporal_fusion", "dense_head"])
             else:
-                set_trainable_prefixes(model, ["xmem", "motion_mask_tf", "temporal_fusion", "dense_head", "backbone_2d"])
+                set_trainable_prefixes(model, ["xmem", "motion_transform_net", "aux_head", "temporal_fusion", "dense_head", "backbone_2d"])
 
             optimizer = build_stage_optimizer(model, cfg, args)
 
@@ -299,6 +402,9 @@ def main():
 
         logger.info(f"Epoch {epoch + 1}/{total_epochs} stage={st} alpha={alpha:.3f}")
 
+        supervise_det = True 
+        supervise_aux = True
+
         train_one_epoch(
             model=model,
             optimizer=optimizer,
@@ -309,7 +415,10 @@ def main():
             device=device,
             max_grad_norm=args.max_grad_norm,
             alpha_temporal=alpha,
+            supervise_det=supervise_det,
+            supervise_aux=supervise_aux,
         )
+
 
         ckpt_path = os.path.join("log", f"ckpt_epoch_{epoch + 1}.pth")
         torch.save(

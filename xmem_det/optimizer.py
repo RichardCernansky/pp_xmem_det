@@ -1,22 +1,13 @@
-
 import torch
-
-def collect_params(model, prefixes):
-    out = []
-    for n, p in model.named_parameters():
-        if p.requires_grad and any(n.startswith(pref) for pref in prefixes):
-            out.append(p)
-    return out
-
 
 def build_stage_optimizer(model, cfg, args):
     base_lr = float(cfg.OPTIMIZATION.LR)
 
-    temporal_prefixes = ("xmem", "motion_mask_tf", "temporal_fusion")
+    temporal_prefixes = ("xmem", "motion_transform_net", "aux_head", "temporal_fusion")
     head_prefixes = ("dense_head",)
     backbone2d_prefixes = ("backbone_2d",)
 
-    temporal, head, backbone2d = [], [], []
+    temporal, head, backbone2d, rest = [], [], [], []
     seen = set()
 
     for n, p in model.named_parameters():
@@ -25,13 +16,16 @@ def build_stage_optimizer(model, cfg, args):
         pid = id(p)
         if pid in seen:
             continue
+        seen.add(pid)
 
         if n.startswith(temporal_prefixes):
-            temporal.append(p); seen.add(pid)
+            temporal.append(p)
         elif n.startswith(head_prefixes):
-            head.append(p); seen.add(pid)
+            head.append(p)
         elif n.startswith(backbone2d_prefixes):
-            backbone2d.append(p); seen.add(pid)
+            backbone2d.append(p)
+        else:
+            rest.append(p)
 
     param_groups = []
     if temporal:
@@ -40,6 +34,8 @@ def build_stage_optimizer(model, cfg, args):
         param_groups.append({"params": head, "lr": base_lr * float(args.head_lr_mult)})
     if backbone2d:
         param_groups.append({"params": backbone2d, "lr": base_lr * float(args.backbone2d_lr_mult)})
+    if rest:
+        param_groups.append({"params": rest, "lr": base_lr})
 
     if not param_groups:
         raise ValueError("No trainable parameters found for optimizer. Check requires_grad and stage prefixes.")

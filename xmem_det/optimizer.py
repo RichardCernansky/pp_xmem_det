@@ -11,8 +11,6 @@ def build_stage_optimizer(model, cfg, args):
     seen = set()
 
     for n, p in model.named_parameters():
-        if not p.requires_grad:
-            continue
         pid = id(p)
         if pid in seen:
             continue
@@ -36,9 +34,6 @@ def build_stage_optimizer(model, cfg, args):
         param_groups.append({"params": backbone2d, "lr": base_lr * float(args.backbone2d_lr_mult)})
     if rest:
         param_groups.append({"params": rest, "lr": base_lr})
-
-    if not param_groups:
-        raise ValueError("No trainable parameters found for optimizer. Check requires_grad and stage prefixes.")
 
     return torch.optim.SGD(
         param_groups,

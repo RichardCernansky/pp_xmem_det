@@ -12,12 +12,13 @@ STRIDE=4
 MAX_GRAD_NORM=35.0
 
 STAGE1_EPOCHS=2
-STAGE2A_EPOCHS=2
+STAGE2A_EPOCHS=15
 STAGE2B_EPOCHS=8
-STAGE2C_EPOCHS=6
+STAGE2C_EPOCHS=8
 STAGE3_EPOCHS=5
 
-HEAD_LR_MULT=0.1
+HEAD_LR_MULT=1
+TEMPORAL_LR_MULT=0.1
 BACKBONE2D_LR_MULT=0.05
 
 python train_temporal.py \
@@ -35,4 +36,5 @@ python train_temporal.py \
   --stage2c_epochs "$STAGE2C_EPOCHS" \
   --stage3_epochs "$STAGE3_EPOCHS" \
   --head_lr_mult "$HEAD_LR_MULT" \
-  --backbone2d_lr_mult "$BACKBONE2D_LR_MULT"
+  --backbone2d_lr_mult "$BACKBONE2D_LR_MULT" \
+  --temporal_lr_mult "$TEMPORAL_LR_MULT"

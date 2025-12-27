@@ -5,6 +5,8 @@ import numpy as np
 import torch
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
+
 
 from datasets.nuscenes_seq_dataset import NuScenesSeqDataset, collate_seq
 from xmem_det.temporal_pp import TemporalPointPillar
@@ -14,6 +16,23 @@ from pcdet.config import cfg, cfg_from_yaml_file
 from pcdet.utils import common_utils
 
 from xmem_det.util import load_xmem_train_cfg
+
+import math
+def build_stage_scheduler(optimizer, stage_steps, warmup_frac=0.05, start_factor=0.1, eta_min=0.0):
+    stage_steps = int(stage_steps)
+    if stage_steps <= 1:
+        return None
+
+    warmup_steps = int(stage_steps * float(warmup_frac))
+    warmup_steps = max(0, min(warmup_steps, stage_steps - 1))
+
+    if warmup_steps == 0:
+        return CosineAnnealingLR(optimizer, T_max=stage_steps, eta_min=float(eta_min))
+
+    s1 = LinearLR(optimizer, start_factor=float(start_factor), total_iters=warmup_steps)
+    s2 = CosineAnnealingLR(optimizer, T_max=stage_steps - warmup_steps, eta_min=float(eta_min))
+    return SequentialLR(optimizer, schedulers=[s1, s2], milestones=[warmup_steps])
+
 
 def set_trainable_prefixes(model, prefixes):
     for n, p in model.named_parameters():
@@ -114,6 +133,7 @@ from collections import deque
 def train_one_epoch(
     model,
     optimizer,
+    scheduler,
     train_loader,
     epoch,
     total_epochs,
@@ -126,6 +146,7 @@ def train_one_epoch(
 ):
     model.train()
 
+    from collections import deque
     w = 200
     w_loss = deque(maxlen=w)
     w_cls = deque(maxlen=w)
@@ -214,6 +235,8 @@ def train_one_epoch(
         loss.backward()
         clip_grad_norm_(model.parameters(), max_grad_norm)
         optimizer.step()
+        if scheduler is not None:
+            scheduler.step()
 
         loss_v = _to_float(loss)
         w_loss.append(loss_v)
@@ -308,6 +331,7 @@ def main():
 
     parser.add_argument("--head_lr_mult", type=float, default=0.1)
     parser.add_argument("--backbone2d_lr_mult", type=float, default=0.05)
+    parser.add_argument("--temporal_lr_mult", type=float, default=1)
 
 
     # SETUP 
@@ -366,48 +390,63 @@ def main():
     total_epochs = int(cfg.OPTIMIZATION.NUM_EPOCHS)
 
 
-
-
     # Training loop with staged training
     logger.info("Start training temporal PointPillar with cyclical XMem gating")
 
-    e1, e2a, e2b, e2c, e3 = stage_plan(args)
-    total_epochs = e3
 
-    optimizer = None
     prev_stage = None
-
     for epoch in range(start_epoch, total_epochs):
         st = stage_name(epoch, args)
         alpha = alpha_for_epoch(epoch, args)
 
+        optimizer = build_stage_optimizer(model, cfg, args)
+
+
+        e1, e2a, e2b, e2c, e3 = stage_plan(args)
+        total_epochs = e3
+
+        steps_per_epoch = len(train_loader)
+
+        if st == "stage1":
+            stage_end = e1
+        elif st == "stage2a":
+            stage_end = e2a
+        elif st == "stage2b_warm":
+            stage_end = e2a + 1
+        elif st == "stage2b":
+            stage_end = e2b
+        elif st == "stage2c":
+            stage_end = e2c
+        else:
+            stage_end = e3
+
+        stage_steps = (stage_end - epoch) * steps_per_epoch
+        scheduler = build_stage_scheduler(optimizer, stage_steps, warmup_frac=0.05, start_factor=0.1, eta_min=0.0)
+
+        if st == "stage2b" and epoch == e2a:
+            st = "stage2b_warm"
+            alpha = 0.7
+
         if st != prev_stage:
             if st in ["stage1", "stage2a"]:
                 set_trainable_prefixes(model, ["xmem", "motion_transform_net", "aux_head", "temporal_fusion"])
+            elif st == "stage2b_warm":
+                set_trainable_prefixes(model, ["dense_head"])
             elif st == "stage2b":
                 set_trainable_prefixes(model, ["xmem", "motion_transform_net", "aux_head", "temporal_fusion", "dense_head"])
             else:
                 set_trainable_prefixes(model, ["xmem", "motion_transform_net", "aux_head", "temporal_fusion", "dense_head", "backbone_2d"])
-
-            optimizer = build_stage_optimizer(model, cfg, args)
-
-            if resume_blob is not None:
-                try:
-                    optimizer.load_state_dict(resume_blob["optimizer_state"])
-                except Exception as e:
-                    logger.info(f"Optimizer state not loaded (safe to ignore): {e}")
-                resume_blob = None
-
             prev_stage = st
 
         logger.info(f"Epoch {epoch + 1}/{total_epochs} stage={st} alpha={alpha:.3f}")
 
-        supervise_det = True 
+        supervise_det = True
         supervise_aux = True
 
         train_one_epoch(
             model=model,
             optimizer=optimizer,
+            scheduler=scheduler,
             train_loader=train_loader,
             epoch=epoch,
             total_epochs=total_epochs,
@@ -419,13 +458,13 @@ def main():
             supervise_aux=supervise_aux,
         )
 
-
         ckpt_path = os.path.join("log", f"ckpt_epoch_{epoch + 1}.pth")
         torch.save(
             {
                 "model_state": model.state_dict(),
                 "epoch": epoch + 1,
                 "optimizer_state": optimizer.state_dict(),
+                "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
                 "stage_cfg": {
                     "stage1_epochs": args.stage1_epochs,
                     "stage2a_epochs": args.stage2a_epochs,

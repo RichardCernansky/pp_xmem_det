@@ -263,7 +263,7 @@ def train_phase1(
     device,
     resume_blob=None,
     start_epoch=0,
-    epochs=40,
+    epochs=20,
     lr_start=1e-4,
     lr_max=1e-3,
     lr_end=1e-6,

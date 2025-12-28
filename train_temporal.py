@@ -10,70 +10,18 @@ from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 
 from datasets.nuscenes_seq_dataset import NuScenesSeqDataset, collate_seq
 from xmem_det.temporal_pp import TemporalPointPillar
-from xmem_det.optimizer import build_stage_optimizer
+from xmem_det.optimizer import build_optimizer_trainable_only, WarmRestartCosineDecay
 
 from pcdet.config import cfg, cfg_from_yaml_file
 from pcdet.utils import common_utils
 
 from xmem_det.util import load_xmem_train_cfg
 
-import math
-def build_stage_scheduler(optimizer, stage_steps, warmup_frac=0.05, start_factor=0.1, eta_min=0.0):
-    stage_steps = int(stage_steps)
-    if stage_steps <= 1:
-        return None
-
-    warmup_steps = int(stage_steps * float(warmup_frac))
-    warmup_steps = max(0, min(warmup_steps, stage_steps - 1))
-
-    if warmup_steps == 0:
-        return CosineAnnealingLR(optimizer, T_max=stage_steps, eta_min=float(eta_min))
-
-    s1 = LinearLR(optimizer, start_factor=float(start_factor), total_iters=warmup_steps)
-    s2 = CosineAnnealingLR(optimizer, T_max=stage_steps - warmup_steps, eta_min=float(eta_min))
-    return SequentialLR(optimizer, schedulers=[s1, s2], milestones=[warmup_steps])
-
-
 def set_trainable_prefixes(model, prefixes):
+    prefixes = tuple(prefixes)
     for n, p in model.named_parameters():
-        p.requires_grad = any(n.startswith(pref) for pref in prefixes)
+        p.requires_grad = n.startswith(prefixes)
 
-def stage_plan(args):
-    e1 = args.stage1_epochs
-    e2a = e1 + args.stage2a_epochs
-    e2b = e2a + args.stage2b_epochs
-    e2c = e2b + args.stage2c_epochs
-    e3 = e2c + args.stage3_epochs
-    return e1, e2a, e2b, e2c, e3
-
-def alpha_for_epoch(epoch, args):
-    e1, e2a, e2b, e2c, _ = stage_plan(args)
-
-    if epoch < e1:
-        return 0.3  # Start with some temporal (not 0!)
-    if epoch < e2a:
-        k = epoch - e1
-        d = max(args.stage2a_epochs, 1)
-        return 0.3 + (0.7 - 0.3) * (k + 1) / d  # Ramp to 0.7
-    if epoch < e2b:
-        k = epoch - e2a
-        d = max(args.stage2b_epochs, 1)
-        return 0.7 + (1.0 - 0.7) * (k + 1) / d  # Ramp to 1.0
-    return 1.0
-
-def stage_name(epoch, args):
-    e1, e2a, e2b, e2c, e3 = stage_plan(args)
-    if epoch < e1:
-        return "stage1"
-    if epoch < e2a:
-        return "stage2a"
-    if epoch < e2b:
-        return "stage2b"
-    if epoch < e2c:
-        return "stage2c"
-    if epoch < e3:
-        return "stage3"
-    return "stage3"
 
 
 def rel_T_curr_prev(T_world_lidar: np.ndarray, t: int) -> np.ndarray:
@@ -127,7 +75,6 @@ def build_seq_loader(cfg, logger, workers, seq_len, stride):
     )
 
     return train_set, train_loader
-
 
 from collections import deque
 def train_one_epoch(
@@ -309,6 +256,156 @@ def train_one_epoch(
         msg += f", win200_aux {_avg(w_aux):.4f}"
     logger.info(msg)
 
+def train_phase1(
+    model,
+    train_loader,
+    cfg,
+    logger,
+    device,
+    resume_blob=None,
+    start_epoch=0,
+    epochs=40,
+    lr_max=1e-3,
+    lr_min=1e-5,
+    cycle_epochs=10,
+    gamma=0.85,
+    alpha_start=0.3,
+    alpha_end=1.0,
+    alpha_ramp_epochs=20,
+):
+    def alpha_ramp_epoch(epoch_idx):
+        s = float(alpha_start)
+        e = float(alpha_end)
+        r = int(alpha_ramp_epochs)
+        if r <= 0:
+            return e
+        if epoch_idx >= r:
+            return e
+        x = (epoch_idx + 1) / r
+        return s + (e - s) * x
+
+    temporal_prefixes = (
+        "xmem",
+        "motion_transform_net",
+        "aux_head",
+        "temporal_fusion",
+        "state_gate",
+        "state_cand",
+    )
+
+    set_trainable_prefixes(model, temporal_prefixes)
+
+    def count_parameters(model):
+        total = sum(p.numel() for p in model.parameters())
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Total Params: {total:,}")
+        print(f"Trainable Params: {trainable:,}")
+    count_parameters(model)
+    def print_full_summary(model):
+        total_params = 0
+        trainable_params = 0
+        
+        print(f"{'Module Name':<30} | {'Parameters':<15} | {'Status'}")
+        print("-" * 65)
+
+        # .named_children() only looks at top-level modules (vfe, xmem, etc.)
+        for name, module in model.named_children():
+            n_params = sum(p.numel() for p in module.parameters())
+            # A module is 'Training' if at least one parameter has requires_grad=True
+            is_trainable = any(p.requires_grad for p in module.parameters())
+            
+            status = "TRAINING" if is_trainable else "FROZEN"
+            total_params += n_params
+            if is_trainable:
+                trainable_params += n_params
+                
+            print(f"{name:<30} | {n_params:>15,} | {status}")
+
+        print("-" * 65)
+        print(f"{'TOTAL':<30} | {total_params:>15,}")
+        print(f"{'TOTAL TRAINABLE':<30} | {trainable_params:>15,}")
+
+    # Usage
+    print_full_summary(model)
+
+    optimizer = build_optimizer_trainable_only(model, cfg, lr=lr_max)
+
+    steps_per_epoch = len(train_loader)
+    steps_per_cycle = int(cycle_epochs) * steps_per_epoch
+
+    scheduler = WarmRestartCosineDecay(
+        optimizer=optimizer,
+        steps_per_cycle=steps_per_cycle,
+        lr_max=lr_max,
+        lr_min=lr_min,
+        gamma=gamma,
+    )
+
+    if resume_blob is not None:
+        opt_state = resume_blob.get("optimizer_state", None)
+        sch_state = resume_blob.get("scheduler_state", None)
+        if opt_state is not None:
+            optimizer.load_state_dict(opt_state)
+        if sch_state is not None:
+            scheduler.load_state_dict(sch_state)
+
+    total_epochs = int(epochs)
+    start_epoch = int(start_epoch)
+
+    if start_epoch >= total_epochs:
+        logger.info(f"Phase1: start_epoch={start_epoch} >= epochs={total_epochs}, nothing to do")
+        return
+
+    logger.info(
+        f"Phase1 start: epochs={total_epochs}, lr_max={float(lr_max):.3e}, lr_min={float(lr_min):.3e}, "
+        f"cycle_epochs={int(cycle_epochs)}, gamma={float(gamma):.3f}, "
+        f"alpha_start={float(alpha_start):.3f}, alpha_end={float(alpha_end):.3f}, alpha_ramp_epochs={int(alpha_ramp_epochs)}"
+    )
+
+    for epoch in range(start_epoch, total_epochs):
+        alpha = alpha_ramp_epoch(epoch)
+        logger.info(
+            f"Epoch {epoch + 1}/{total_epochs} phase=phase1 alpha={alpha:.3f} cycle={scheduler.cycle} lr_max={scheduler.lr_max:.3e}"
+        )
+
+        train_one_epoch(
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            train_loader=train_loader,
+            epoch=epoch,
+            total_epochs=total_epochs,
+            logger=logger,
+            device=device,
+            max_grad_norm=35.0,
+            alpha_temporal=alpha,
+            supervise_det=True,
+            supervise_aux=True,
+        )
+
+        ckpt_path = os.path.join("log", f"phase1_ckpt_epoch_{epoch + 1}.pth")
+        torch.save(
+            {
+                "model_state": model.state_dict(),
+                "epoch": epoch + 1,
+                "optimizer_state": optimizer.state_dict(),
+                "scheduler_state": scheduler.state_dict(),
+                "phase": "phase1",
+                "phase1_cfg": {
+                    "epochs": total_epochs,
+                    "lr_max": float(lr_max),
+                    "lr_min": float(lr_min),
+                    "cycle_epochs": int(cycle_epochs),
+                    "gamma": float(gamma),
+                    "alpha_start": float(alpha_start),
+                    "alpha_end": float(alpha_end),
+                    "alpha_ramp_epochs": int(alpha_ramp_epochs),
+                },
+            },
+            ckpt_path,
+        )
+        logger.info(f"Saved checkpoint to {ckpt_path}")
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -323,15 +420,8 @@ def main():
     parser.add_argument("--resume_ckpt", type=str, default=None)
     parser.add_argument("--pretrained_pp_ckpt", type=str, default=None)
 
-    parser.add_argument("--stage1_epochs", type=int, default=5)
-    parser.add_argument("--stage2a_epochs", type=int, default=2)
-    parser.add_argument("--stage2b_epochs", type=int, default=6)
-    parser.add_argument("--stage2c_epochs", type=int, default=5)
-    parser.add_argument("--stage3_epochs", type=int, default=5)
+    parser.add_argument("--phase1", action="store_true")
 
-    parser.add_argument("--head_lr_mult", type=float, default=0.1)
-    parser.add_argument("--backbone2d_lr_mult", type=float, default=0.05)
-    parser.add_argument("--temporal_lr_mult", type=float, default=1)
 
 
     # SETUP 
@@ -389,93 +479,21 @@ def main():
 
     total_epochs = int(cfg.OPTIMIZATION.NUM_EPOCHS)
 
-
     # Training loop with staged training
     logger.info("Start training temporal PointPillar with cyclical XMem gating")
 
-
-    prev_stage = None
-    for epoch in range(start_epoch, total_epochs):
-        st = stage_name(epoch, args)
-        alpha = alpha_for_epoch(epoch, args)
-
-        optimizer = build_stage_optimizer(model, cfg, args)
-
-
-        e1, e2a, e2b, e2c, e3 = stage_plan(args)
-        total_epochs = e3
-
-        steps_per_epoch = len(train_loader)
-
-        if st == "stage1":
-            stage_end = e1
-        elif st == "stage2a":
-            stage_end = e2a
-        elif st == "stage2b_warm":
-            stage_end = e2a + 1
-        elif st == "stage2b":
-            stage_end = e2b
-        elif st == "stage2c":
-            stage_end = e2c
-        else:
-            stage_end = e3
-
-        stage_steps = (stage_end - epoch) * steps_per_epoch
-        scheduler = build_stage_scheduler(optimizer, stage_steps, warmup_frac=0.05, start_factor=0.1, eta_min=0.0)
-
-        if st == "stage2b" and epoch == e2a:
-            st = "stage2b_warm"
-            alpha = 0.7
-
-        if st != prev_stage:
-            if st in ["stage1", "stage2a"]:
-                set_trainable_prefixes(model, ["xmem", "motion_transform_net", "aux_head", "temporal_fusion"])
-            elif st == "stage2b_warm":
-                set_trainable_prefixes(model, ["dense_head"])
-            elif st == "stage2b":
-                set_trainable_prefixes(model, ["xmem", "motion_transform_net", "aux_head", "temporal_fusion", "dense_head"])
-            else:
-                set_trainable_prefixes(model, ["xmem", "motion_transform_net", "aux_head", "temporal_fusion", "dense_head", "backbone_2d"])
-            prev_stage = st
-
-        logger.info(f"Epoch {epoch + 1}/{total_epochs} stage={st} alpha={alpha:.3f}")
-
-        supervise_det = True
-        supervise_aux = True
-
-        train_one_epoch(
+    if args.phase1:
+        train_phase1(
             model=model,
-            optimizer=optimizer,
-            scheduler=scheduler,
             train_loader=train_loader,
-            epoch=epoch,
-            total_epochs=total_epochs,
+            cfg=cfg,
             logger=logger,
             device=device,
-            max_grad_norm=args.max_grad_norm,
-            alpha_temporal=alpha,
-            supervise_det=supervise_det,
-            supervise_aux=supervise_aux,
+            resume_blob=resume_blob,
+            start_epoch=start_epoch,
         )
+        return
 
-        ckpt_path = os.path.join("log", f"ckpt_epoch_{epoch + 1}.pth")
-        torch.save(
-            {
-                "model_state": model.state_dict(),
-                "epoch": epoch + 1,
-                "optimizer_state": optimizer.state_dict(),
-                "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
-                "stage_cfg": {
-                    "stage1_epochs": args.stage1_epochs,
-                    "stage2a_epochs": args.stage2a_epochs,
-                    "stage2b_epochs": args.stage2b_epochs,
-                    "stage2c_epochs": args.stage2c_epochs,
-                    "stage3_epochs": args.stage3_epochs,
-                },
-            },
-            ckpt_path,
-        )
-        logger.info(f"Saved checkpoint to {ckpt_path}")
 
 
 

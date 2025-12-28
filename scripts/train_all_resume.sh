@@ -30,11 +30,4 @@ python train_temporal.py \
   --seq_len "$SEQ_LEN" \
   --stride "$STRIDE" \
   --max_grad_norm "$MAX_GRAD_NORM" \
-  --stage1_epochs "$STAGE1_EPOCHS" \
-  --stage2a_epochs "$STAGE2A_EPOCHS" \
-  --stage2b_epochs "$STAGE2B_EPOCHS" \
-  --stage2c_epochs "$STAGE2C_EPOCHS" \
-  --stage3_epochs "$STAGE3_EPOCHS" \
-  --head_lr_mult "$HEAD_LR_MULT" \
-  --backbone2d_lr_mult "$BACKBONE2D_LR_MULT" \
-  --temporal_lr_mult "$TEMPORAL_LR_MULT"
+  --phase1

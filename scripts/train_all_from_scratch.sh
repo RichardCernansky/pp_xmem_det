@@ -17,10 +17,6 @@ STAGE2B_EPOCHS=8
 STAGE2C_EPOCHS=8
 STAGE3_EPOCHS=5
 
-HEAD_LR_MULT=1
-TEMPORAL_LR_MULT=0.1
-BACKBONE2D_LR_MULT=0.05
-
 python train_temporal.py \
   --cfg_file "$CFG_FILE" \
   --xmem_cfg "$XMEM_CFG" \
@@ -30,11 +26,4 @@ python train_temporal.py \
   --seq_len "$SEQ_LEN" \
   --stride "$STRIDE" \
   --max_grad_norm "$MAX_GRAD_NORM" \
-  --stage1_epochs "$STAGE1_EPOCHS" \
-  --stage2a_epochs "$STAGE2A_EPOCHS" \
-  --stage2b_epochs "$STAGE2B_EPOCHS" \
-  --stage2c_epochs "$STAGE2C_EPOCHS" \
-  --stage3_epochs "$STAGE3_EPOCHS" \
-  --head_lr_mult "$HEAD_LR_MULT" \
-  --backbone2d_lr_mult "$BACKBONE2D_LR_MULT" \
-  --temporal_lr_mult "$TEMPORAL_LR_MULT"
+  --phase1

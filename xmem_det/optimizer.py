@@ -1,4 +1,4 @@
-import math
+from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 import torch
 
 
@@ -81,4 +81,35 @@ def build_optimizer_trainable_only(model, cfg, lr):
         lr=float(lr),
         momentum=float(cfg.OPTIMIZATION.MOMENTUM),
         weight_decay=float(cfg.OPTIMIZATION.WEIGHT_DECAY),
+    )
+
+def build_warmup_cosine_scheduler(optimizer, steps_per_epoch, epochs, lr_start=1e-4, lr_max=1e-3, lr_end=1e-6, warmup_epochs=1):
+    total_steps = int(steps_per_epoch) * int(epochs)
+    warmup_steps = int(steps_per_epoch) * int(warmup_epochs)
+    warmup_steps = max(1, min(warmup_steps, total_steps - 1))
+
+    for pg in optimizer.param_groups:
+        pg["lr"] = lr_max
+
+    start_factor = float(lr_start) / float(lr_max)
+
+    warmup = LinearLR(
+        optimizer,
+        start_factor=start_factor,
+        end_factor=1.0,
+        total_iters=warmup_steps,
+    )
+
+    decay_steps = total_steps - warmup_steps
+
+    cosine = CosineAnnealingLR(
+        optimizer,
+        T_max=decay_steps,
+        eta_min=lr_end,
+    )
+
+    return SequentialLR(
+        optimizer,
+        schedulers=[warmup, cosine],
+        milestones=[warmup_steps],
     )

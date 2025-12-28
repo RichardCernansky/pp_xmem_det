@@ -5,12 +5,11 @@ import numpy as np
 import torch
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 
 
 from datasets.nuscenes_seq_dataset import NuScenesSeqDataset, collate_seq
 from xmem_det.temporal_pp import TemporalPointPillar
-from xmem_det.optimizer import build_optimizer_trainable_only, WarmRestartCosineDecay
+from xmem_det.optimizer import build_optimizer_trainable_only, build_warmup_cosine_scheduler 
 
 from pcdet.config import cfg, cfg_from_yaml_file
 from pcdet.utils import common_utils
@@ -21,7 +20,6 @@ def set_trainable_prefixes(model, prefixes):
     prefixes = tuple(prefixes)
     for n, p in model.named_parameters():
         p.requires_grad = n.startswith(prefixes)
-
 
 
 def rel_T_curr_prev(T_world_lidar: np.ndarray, t: int) -> np.ndarray:
@@ -256,6 +254,7 @@ def train_one_epoch(
         msg += f", win200_aux {_avg(w_aux):.4f}"
     logger.info(msg)
 
+
 def train_phase1(
     model,
     train_loader,
@@ -265,10 +264,10 @@ def train_phase1(
     resume_blob=None,
     start_epoch=0,
     epochs=40,
+    lr_start=1e-4,
     lr_max=1e-3,
-    lr_min=1e-5,
-    cycle_epochs=10,
-    gamma=0.85,
+    lr_end=1e-6,
+    warmup_epochs=1,
     alpha_start=0.3,
     alpha_end=1.0,
     alpha_ramp_epochs=20,
@@ -295,50 +294,18 @@ def train_phase1(
 
     set_trainable_prefixes(model, temporal_prefixes)
 
-    def count_parameters(model):
-        total = sum(p.numel() for p in model.parameters())
-        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"Total Params: {total:,}")
-        print(f"Trainable Params: {trainable:,}")
-    count_parameters(model)
-    def print_full_summary(model):
-        total_params = 0
-        trainable_params = 0
-        
-        print(f"{'Module Name':<30} | {'Parameters':<15} | {'Status'}")
-        print("-" * 65)
-
-        # .named_children() only looks at top-level modules (vfe, xmem, etc.)
-        for name, module in model.named_children():
-            n_params = sum(p.numel() for p in module.parameters())
-            # A module is 'Training' if at least one parameter has requires_grad=True
-            is_trainable = any(p.requires_grad for p in module.parameters())
-            
-            status = "TRAINING" if is_trainable else "FROZEN"
-            total_params += n_params
-            if is_trainable:
-                trainable_params += n_params
-                
-            print(f"{name:<30} | {n_params:>15,} | {status}")
-
-        print("-" * 65)
-        print(f"{'TOTAL':<30} | {total_params:>15,}")
-        print(f"{'TOTAL TRAINABLE':<30} | {trainable_params:>15,}")
-
-    # Usage
-    print_full_summary(model)
-
-    optimizer = build_optimizer_trainable_only(model, cfg, lr=lr_max)
+    optimizer = build_optimizer_trainable_only(model, cfg, lr=lr_start)
 
     steps_per_epoch = len(train_loader)
-    steps_per_cycle = int(cycle_epochs) * steps_per_epoch
 
-    scheduler = WarmRestartCosineDecay(
+    scheduler = build_warmup_cosine_scheduler(
         optimizer=optimizer,
-        steps_per_cycle=steps_per_cycle,
+        steps_per_epoch=steps_per_epoch,
+        epochs=epochs,
+        lr_start=lr_start,
         lr_max=lr_max,
-        lr_min=lr_min,
-        gamma=gamma,
+        lr_end=lr_end,
+        warmup_epochs=warmup_epochs,
     )
 
     if resume_blob is not None:
@@ -357,16 +324,15 @@ def train_phase1(
         return
 
     logger.info(
-        f"Phase1 start: epochs={total_epochs}, lr_max={float(lr_max):.3e}, lr_min={float(lr_min):.3e}, "
-        f"cycle_epochs={int(cycle_epochs)}, gamma={float(gamma):.3f}, "
+        f"Phase1 start: epochs={total_epochs}, steps_per_epoch={len(train_loader)}, "
+        f"lr_start={float(lr_start):.3e}, lr_max={float(lr_max):.3e}, lr_end={float(lr_end):.3e}, warmup_epochs={int(warmup_epochs)}, "
         f"alpha_start={float(alpha_start):.3f}, alpha_end={float(alpha_end):.3f}, alpha_ramp_epochs={int(alpha_ramp_epochs)}"
     )
 
     for epoch in range(start_epoch, total_epochs):
         alpha = alpha_ramp_epoch(epoch)
-        logger.info(
-            f"Epoch {epoch + 1}/{total_epochs} phase=phase1 alpha={alpha:.3f} cycle={scheduler.cycle} lr_max={scheduler.lr_max:.3e}"
-        )
+        lr = optimizer.param_groups[0]["lr"]
+        logger.info(f"Epoch {epoch + 1}/{total_epochs} phase=phase1 alpha={alpha:.3f} lr={lr:.3e}")
 
         train_one_epoch(
             model=model,
@@ -392,11 +358,11 @@ def train_phase1(
                 "scheduler_state": scheduler.state_dict(),
                 "phase": "phase1",
                 "phase1_cfg": {
-                    "epochs": total_epochs,
+                    "epochs": int(total_epochs),
+                    "lr_start": float(lr_start),
                     "lr_max": float(lr_max),
-                    "lr_min": float(lr_min),
-                    "cycle_epochs": int(cycle_epochs),
-                    "gamma": float(gamma),
+                    "lr_end": float(lr_end),
+                    "warmup_epochs": int(warmup_epochs),
                     "alpha_start": float(alpha_start),
                     "alpha_end": float(alpha_end),
                     "alpha_ramp_epochs": int(alpha_ramp_epochs),

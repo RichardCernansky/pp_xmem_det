@@ -27,3 +27,4 @@ python train_temporal.py \
   --stride "$STRIDE" \
   --max_grad_norm "$MAX_GRAD_NORM" \
   --phase1
+

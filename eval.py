@@ -16,6 +16,30 @@ from pcdet.utils import common_utils
 from xmem_det.temporal_pp import TemporalPointPillar
 from xmem_det.util import load_xmem_train_cfg
 
+def deduce_alpha_from_ckpt_if_possible(blob: dict, fallback: float) -> float:
+    if not isinstance(blob, dict):
+        return float(fallback)
+
+    epoch_1based = int(blob.get("epoch", 0))
+    phase1_cfg = blob.get("phase1_cfg", None)
+
+    if epoch_1based <= 0 or not isinstance(phase1_cfg, dict):
+        return float(fallback)
+
+    s = float(phase1_cfg.get("alpha_start", fallback))
+    e = float(phase1_cfg.get("alpha_end", fallback))
+    r = int(phase1_cfg.get("alpha_ramp_epochs", 0))
+
+    if r <= 0:
+        return float(e)
+
+    epoch_idx = max(epoch_1based - 1, 0)
+    if epoch_idx >= r:
+        return float(e)
+
+    x = (epoch_idx + 1) / r
+    return float(s + (e - s) * x)
+
 
 def to_torch_batch_dict(frame_dict, device):
     """
@@ -187,7 +211,6 @@ def main():
     logger.info(f"cfg_file={args.cfg_file}")
     logger.info(f"ckpt={args.ckpt}")
     logger.info(f"split={cfg.DATA_CONFIG.DATA_SPLIT['test']}")
-    logger.info(f"alpha={args.alpha}")
     logger.info(f"seq_len={args.seq_len}")
     log_config_to_file(cfg, logger=logger)
 
@@ -260,9 +283,17 @@ def main():
     Your training saves {"model_state": ...}, so we handle both that and raw state_dict.
     """
     blob = torch.load(args.ckpt, map_location="cpu")
+
+    alpha_used = deduce_alpha_from_ckpt_if_possible(
+        blob if isinstance(blob, dict) else {},
+        float(args.alpha),
+    )
+    logger.info(f"alpha={alpha_used}")
+
     state = blob["model_state"] if isinstance(blob, dict) and "model_state" in blob else blob
     model.load_state_dict(state, strict=True)
     model.eval()
+
 
     """
     We must produce a prediction for every dataset index (every frame).
@@ -345,10 +376,17 @@ def main():
                         t_seq=int(step),
                         det_instance_masks_prev=det_instance_masks_prev,
                         T_rel=T_rel,
-                        alpha_temporal=float(args.alpha),
+                       alpha_temporal=float(alpha_used),
                         compute_det_loss=False,
                         compute_aux_loss=False,
                     )
+                    
+                    # pd = pred_dicts[0]
+                    # num = int(pd["pred_boxes"].shape[0])
+                    # mx = float(pd["pred_scores"].max().item()) if num > 0 else 0.0
+                    # if done_samples % int(args.log_interval) == 0:
+                    #     logger.info(f"sample idx={idx} step={step} num_boxes={num} max_score={mx:.4f}")
+
 
                     """
                     Track the last frame’s prediction, because option 1 evaluates only the last timestep.

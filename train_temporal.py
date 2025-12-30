@@ -263,12 +263,12 @@ def train_phase1(
     device,
     resume_blob=None,
     start_epoch=0,
-    epochs=20,
-    lr_start=1e-4,
-    lr_max=1e-3,
+    epochs=40,
+    lr_start=5e-5,
+    lr_max=1e-4,
     lr_end=1e-6,
     warmup_epochs=1,
-    alpha_start=0.3,
+    alpha_start=1,
     alpha_end=1.0,
     alpha_ramp_epochs=20,
 ):
@@ -308,13 +308,13 @@ def train_phase1(
         warmup_epochs=warmup_epochs,
     )
 
-    if resume_blob is not None:
-        opt_state = resume_blob.get("optimizer_state", None)
-        sch_state = resume_blob.get("scheduler_state", None)
-        if opt_state is not None:
-            optimizer.load_state_dict(opt_state)
-        if sch_state is not None:
-            scheduler.load_state_dict(sch_state)
+    # if resume_blob is not None:
+    #     opt_state = resume_blob.get("optimizer_state", None)
+    #     sch_state = resume_blob.get("scheduler_state", None)
+    #     if opt_state is not None:
+    #         optimizer.load_state_dict(opt_state)
+    #     if sch_state is not None:
+    #         scheduler.load_state_dict(sch_state)
 
     total_epochs = int(epochs)
     start_epoch = int(start_epoch)

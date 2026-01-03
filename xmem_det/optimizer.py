@@ -1,61 +1,7 @@
 from torch.optim.lr_scheduler import SequentialLR, LinearLR, CosineAnnealingLR
 import torch
-
-
-class WarmRestartCosineDecay:
-    def __init__(self, optimizer, steps_per_cycle, lr_max, lr_min, gamma):
-        self.optimizer = optimizer
-        self.steps_per_cycle = int(steps_per_cycle)
-        self.lr_max = float(lr_max)
-        self.lr_min = float(lr_min)
-        self.gamma = float(gamma)
-        self.t = 0
-        self.cycle = 0
-        self._apply_lr(self.lr_max)
-
-    def _apply_lr(self, lr):
-        lr = float(lr)
-        for g in self.optimizer.param_groups:
-            g["lr"] = lr
-
-    def _lr_at_t(self):
-        if self.steps_per_cycle <= 1:
-            return self.lr_min
-        x = self.t / (self.steps_per_cycle - 1)
-        c = 0.5 * (1.0 + math.cos(math.pi * x))
-        return self.lr_min + (self.lr_max - self.lr_min) * c
-
-    def step(self):
-        lr = self._lr_at_t()
-        self._apply_lr(lr)
-
-        self.t += 1
-        if self.t >= self.steps_per_cycle:
-            self.t = 0
-            self.cycle += 1
-            self.lr_max = max(self.lr_min, self.lr_max * self.gamma)
-            self._apply_lr(self.lr_max)
-
-        return lr
-
-    def state_dict(self):
-        return {
-            "steps_per_cycle": self.steps_per_cycle,
-            "lr_max": self.lr_max,
-            "lr_min": self.lr_min,
-            "gamma": self.gamma,
-            "t": self.t,
-            "cycle": self.cycle,
-        }
-
-    def load_state_dict(self, d):
-        self.steps_per_cycle = int(d["steps_per_cycle"])
-        self.lr_max = float(d["lr_max"])
-        self.lr_min = float(d["lr_min"])
-        self.gamma = float(d["gamma"])
-        self.t = int(d["t"])
-        self.cycle = int(d["cycle"])
-        self._apply_lr(self._lr_at_t())
+import math
+from torch.optim.lr_scheduler import LambdaLR
 
 
 def set_trainable_prefixes(model, prefixes):
@@ -84,6 +30,7 @@ def build_optimizer_trainable_only(model, cfg, lr):
     )
 
 def build_warmup_cosine_scheduler(optimizer, steps_per_epoch, epochs, lr_start=1e-4, lr_max=1e-3, lr_end=1e-6, warmup_epochs=1):
+
     total_steps = int(steps_per_epoch) * int(epochs)
     warmup_steps = int(steps_per_epoch) * int(warmup_epochs)
     warmup_steps = max(1, min(warmup_steps, total_steps - 1))
@@ -113,3 +60,75 @@ def build_warmup_cosine_scheduler(optimizer, steps_per_epoch, epochs, lr_start=1
         schedulers=[warmup, cosine],
         milestones=[warmup_steps],
     )
+
+
+import torch
+
+def build_optimizer_with_prefix_multipliers(model, cfg, base_lr, group_specs):
+    named = list(model.named_parameters())
+    selected = []
+    seen = set()
+
+    groups = []
+    for prefixes, mult in group_specs:
+        params = []
+        for n, p in named:
+            if not p.requires_grad:
+                continue
+            if not n.startswith(prefixes):
+                continue
+            pid = id(p)
+            if pid in seen:
+                continue
+            seen.add(pid)
+            params.append(p)
+        if params:
+            groups.append({"params": params, "lr": float(base_lr) * float(mult)})
+
+    leftovers = []
+    for n, p in named:
+        if not p.requires_grad:
+            continue
+        pid = id(p)
+        if pid in seen:
+            continue
+        seen.add(pid)
+        leftovers.append(p)
+
+    if leftovers:
+        groups.append({"params": leftovers, "lr": float(base_lr)})
+
+    return torch.optim.SGD(
+        groups,
+        lr=float(base_lr),
+        momentum=float(cfg.OPTIMIZATION.MOMENTUM),
+        weight_decay=float(cfg.OPTIMIZATION.WEIGHT_DECAY),
+    )
+
+
+def build_warmup_cosine_factor_scheduler(optimizer, steps_per_epoch, epochs, lr_start, lr_max, lr_end, warmup_epochs=1):
+    total_steps = int(steps_per_epoch) * int(epochs)
+    warmup_steps = int(steps_per_epoch) * int(warmup_epochs)
+    warmup_steps = max(1, min(warmup_steps, total_steps))
+
+    start_factor = float(lr_start) / float(lr_max)
+    end_factor = float(lr_end) / float(lr_max)
+
+    def factor(step):
+        step = int(step)
+        if warmup_steps >= total_steps:
+            return 1.0
+        if step < warmup_steps:
+            if warmup_steps == 1:
+                return 1.0
+            x = step / float(warmup_steps - 1)
+            return start_factor + (1.0 - start_factor) * x
+        t = step - warmup_steps
+        T = total_steps - warmup_steps
+        if T <= 1:
+            return end_factor
+        x = t / float(T - 1)
+        c = 0.5 * (1.0 + math.cos(math.pi * x))
+        return end_factor + (1.0 - end_factor) * c
+
+    return LambdaLR(optimizer, lr_lambda=[factor for _ in optimizer.param_groups])

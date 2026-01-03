@@ -9,7 +9,7 @@ from torch.utils.data import DataLoader
 
 from datasets.nuscenes_seq_dataset import NuScenesSeqDataset, collate_seq
 from xmem_det.temporal_pp import TemporalPointPillar
-from xmem_det.optimizer import build_optimizer_trainable_only, build_warmup_cosine_scheduler 
+from xmem_det.optimizer import build_optimizer_trainable_only, build_warmup_cosine_scheduler , build_optimizer_with_prefix_multipliers, build_warmup_cosine_factor_scheduler
 
 from pcdet.config import cfg, cfg_from_yaml_file
 from pcdet.utils import common_utils
@@ -255,16 +255,18 @@ def train_one_epoch(
     logger.info(msg)
 
 
-def train_phase1(
+def train_phase(
+    args,
     model,
     train_loader,
     cfg,
     logger,
     device,
+    prefixes,
     resume_blob=None,
     start_epoch=0,
-    epochs=40,
-    lr_start=5e-5,
+    epochs=30,
+    lr_start=2e-5,
     lr_max=1e-4,
     lr_end=1e-6,
     warmup_epochs=1,
@@ -283,30 +285,51 @@ def train_phase1(
         x = (epoch_idx + 1) / r
         return s + (e - s) * x
 
-    temporal_prefixes = (
-        "xmem",
-        "motion_transform_net",
-        "aux_head",
-        "temporal_fusion",
-        "state_gate",
-        "state_cand",
+
+    set_trainable_prefixes(model, prefixes)
+
+    # optimizer = build_optimizer_trainable_only(model, cfg, lr=lr_start)
+
+    # steps_per_epoch = len(train_loader)
+
+    # scheduler = build_warmup_cosine_scheduler(
+    #     optimizer=optimizer,
+    #     steps_per_epoch=steps_per_epoch,
+    #     epochs=epochs,
+    #     lr_start=lr_start,
+    #     lr_max=lr_max,
+    #     lr_end=lr_end,
+    #     warmup_epochs=warmup_epochs,
+    # )
+
+    HEAD_LR_MULT = 0.1 
+    TEMPORAL_LR_MULT = 1.0
+    BACKBONE2D_LR_MULT = 0.05
+    group_specs = [
+        (("dense_head",), HEAD_LR_MULT),
+        (("backbone_2d",), BACKBONE2D_LR_MULT),
+        (("xmem", "motion_transform_net", "aux_head", "temporal_fusion", "state_gate", "state_cand"), TEMPORAL_LR_MULT),
+    ]
+    total_epochs = int(epochs)
+    start_epoch = int(start_epoch)
+
+    optimizer = build_optimizer_with_prefix_multipliers(
+        model=model,
+        cfg=cfg,
+        base_lr=lr_max,
+        group_specs=group_specs,
     )
 
-    set_trainable_prefixes(model, temporal_prefixes)
-
-    optimizer = build_optimizer_trainable_only(model, cfg, lr=lr_start)
-
-    steps_per_epoch = len(train_loader)
-
-    scheduler = build_warmup_cosine_scheduler(
+    scheduler = build_warmup_cosine_factor_scheduler(
         optimizer=optimizer,
-        steps_per_epoch=steps_per_epoch,
-        epochs=epochs,
+        steps_per_epoch=len(train_loader),
+        epochs=(total_epochs - start_epoch),
         lr_start=lr_start,
         lr_max=lr_max,
         lr_end=lr_end,
         warmup_epochs=warmup_epochs,
     )
+
 
     # if resume_blob is not None:
     #     opt_state = resume_blob.get("optimizer_state", None)
@@ -316,15 +339,13 @@ def train_phase1(
     #     if sch_state is not None:
     #         scheduler.load_state_dict(sch_state)
 
-    total_epochs = int(epochs)
-    start_epoch = int(start_epoch)
 
     if start_epoch >= total_epochs:
         logger.info(f"Phase1: start_epoch={start_epoch} >= epochs={total_epochs}, nothing to do")
         return
 
     logger.info(
-        f"Phase1 start: epochs={total_epochs}, steps_per_epoch={len(train_loader)}, "
+        f"Phase {args.phase} start: epochs={total_epochs}, steps_per_epoch={len(train_loader)}, "
         f"lr_start={float(lr_start):.3e}, lr_max={float(lr_max):.3e}, lr_end={float(lr_end):.3e}, warmup_epochs={int(warmup_epochs)}, "
         f"alpha_start={float(alpha_start):.3f}, alpha_end={float(alpha_end):.3f}, alpha_ramp_epochs={int(alpha_ramp_epochs)}"
     )
@@ -332,7 +353,7 @@ def train_phase1(
     for epoch in range(start_epoch, total_epochs):
         alpha = alpha_ramp_epoch(epoch)
         lr = optimizer.param_groups[0]["lr"]
-        logger.info(f"Epoch {epoch + 1}/{total_epochs} phase=phase1 alpha={alpha:.3f} lr={lr:.3e}")
+        logger.info(f"Epoch {epoch + 1}/{total_epochs} alpha={alpha:.3f} lr={lr:.3e}")
 
         train_one_epoch(
             model=model,
@@ -343,13 +364,13 @@ def train_phase1(
             total_epochs=total_epochs,
             logger=logger,
             device=device,
-            max_grad_norm=35.0,
+            max_grad_norm=10.0,
             alpha_temporal=alpha,
             supervise_det=True,
             supervise_aux=True,
         )
 
-        ckpt_path = os.path.join("log", f"phase1_ckpt_epoch_{epoch + 1}.pth")
+        ckpt_path = os.path.join("log", f"phase_ckpt_epoch_{epoch + 1}.pth")
         torch.save(
             {
                 "model_state": model.state_dict(),
@@ -386,8 +407,7 @@ def main():
     parser.add_argument("--resume_ckpt", type=str, default=None)
     parser.add_argument("--pretrained_pp_ckpt", type=str, default=None)
 
-    parser.add_argument("--phase1", action="store_true")
-
+    parser.add_argument('--phase', type=int, default=1, help='Training phase (1 or 2)')
 
 
     # SETUP 
@@ -448,8 +468,19 @@ def main():
     # Training loop with staged training
     logger.info("Start training temporal PointPillar with cyclical XMem gating")
 
-    if args.phase1:
-        train_phase1(
+    if args.phase == 1:
+        PHASE1_PREFIXES = (
+            "xmem",
+            "motion_transform_net",
+            "aux_head",
+            "temporal_fusion",
+            "state_gate",
+            "state_cand",
+        )
+
+        train_phase(
+            args=args,
+            prefixes=PHASE1_PREFIXES,
             model=model,
             train_loader=train_loader,
             cfg=cfg,
@@ -457,9 +488,46 @@ def main():
             device=device,
             resume_blob=resume_blob,
             start_epoch=start_epoch,
+            epochs=5,
+            lr_start=1e-5,
+            lr_max=1e-4,
+            lr_end=5e-5,
+            warmup_epochs=1,
+            alpha_start=0.05,
+            alpha_end=0.35,
+            alpha_ramp_epochs=5
         )
         return
 
+    if args.phase == 2:
+        PHASE2_PREFIXES = (
+            "dense_head",
+            "xmem",
+            "motion_transform_net",
+            "aux_head",
+            "temporal_fusion",
+            "state_gate",
+            "state_cand",
+        )
+        train_phase(
+            args=args,
+            prefixes=PHASE1_PREFIXES,
+            model=model,
+            train_loader=train_loader,
+            cfg=cfg,
+            logger=logger,
+            device=device,
+            resume_blob=resume_blob,
+            start_epoch=start_epoch,
+            epochs=5,
+            lr_start=1e-5,
+            lr_max=1e-4,
+            lr_end=1e-6,
+            warmup_epochs=1,
+            alpha_start=0,
+            alpha_end=0.7,
+            alpha_ramp_epochs=20
+        )
 
 
 
